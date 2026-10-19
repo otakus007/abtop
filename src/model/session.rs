@@ -131,9 +131,9 @@ pub struct ChatMessage {
 pub const MAX_CHAT_MESSAGES: usize = 12;
 
 /// Which surface launched this session's process, detected from the resolved
-/// executable path in its command line. Always `Cli` for Codex and OpenCode
-/// sessions — no desktop-app or editor-extension equivalent is known for
-/// those tools yet.
+/// executable path in its command line. Always `Cli` for Codex, OpenCode, and
+/// Cursor Agent CLI sessions — no desktop-app or editor-extension equivalent
+/// is tracked for those tools yet.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub enum LaunchSurface {
     /// Plain CLI invocation: a terminal shell running an npm/homebrew/native
@@ -222,6 +222,7 @@ pub struct AgentSession {
     /// Config root directory for this session's agent (home-abbreviated, e.g. "~/.claude-work").
     /// For Claude Code: the active .claude* profile folder. For Codex: "~/.codex".
     /// For OpenCode: the data directory containing opencode.db.
+    /// For Cursor Agent CLI: "~/.cursor".
     pub config_root: String,
 }
 
