@@ -2,7 +2,7 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code, Codex CLI, OpenCode, and Cursor Agent CLI (`cursor-agent`) sessions.
+Supports Claude Code, Codex CLI, OpenCode, Cursor Agent CLI (`cursor-agent`), and Grok Build CLI sessions.
 
 ## Language Policy
 
@@ -30,6 +30,7 @@ src/
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
 │   ├── cursor.rs           # Cursor Agent CLI: ps + chat store.db fds + transcript JSONL
+│   ├── grok.rs             # Grok Build: active_sessions.json + session directory files
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
 │   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
 └── model/
@@ -77,7 +78,7 @@ Panel rendering priority (top to bottom):
 
 Panel descriptions:
 - **¹context**: Left = token rate braille sparkline (200-point history). Right = per-session context % bars with yellow/red warning.
-- **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add OpenCode or Cursor Agent rows unless those tools expose a reliable account-level provider rate-limit source.
+- **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add OpenCode, Cursor Agent, or Grok rows unless those tools expose a reliable account-level provider rate-limit source.
 - **³tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
 - **projects** (always visible): Per-project git branch + added/modified file counts.
 - **⁴ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
@@ -183,11 +184,20 @@ Rate limits extracted from `token_count` events:
 - Cursor Agent contributes session/project/port/task data, but not quota or reliable token/context totals. Quota remains Claude + Codex only.
 - Hide with `hidden_agents = ["cursor-agent"]`.
 
-### 6. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
+### 6. Grok Build CLI sessions: `$GROK_HOME` or `~/.grok`
+- Discover running `grok` processes from the shared `ps` snapshot.
+- Bind a PID to `sessions/<encoded-cwd>/<session-id>/`. On Linux, prefer an open fd under that directory. Otherwise use the newest `active_sessions.json` row for the PID. Process PWD is not the session cwd.
+- Read `summary.json` (model, title, branch), `usage.json` (token totals), and `signals.json` (context window and turn count). `usage.json` `inputTokens` already includes cached reads; subtract `cachedReadTokens` before storing so session totals are not double-counted.
+- Tail `events.jsonl` for status and `updates.jsonl` for the current tool name and file path. Do not read `chat_history.jsonl` or tool bodies.
+- Skip `session_kind = subagent` as a top-level row. List children from `subagents/<id>/meta.json` (`subagent_type`, `status` only).
+- Use `generated_title` as the session title. Do not call `claude --print` for Grok sessions.
+- Grok contributes session, token, context, project, and port data, but not quota data. Hide with `hidden_agents = ["grok"]`.
+
+### 7. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
 - `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
 
-### 7. Process tree: `ps` + `lsof`
+### 8. Process tree: `ps` + `lsof`
 ```bash
 ps -eo pid,ppid,rss,%cpu,command    # All processes
 lsof -i -P -n -sTCP:LISTEN         # Open ports
@@ -195,16 +205,16 @@ lsof -i -P -n -sTCP:LISTEN         # Open ports
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
 
-### 8. Git status per project
+### 9. Git status per project
 ```bash
 git -C {cwd} status --porcelain     # added/modified file counts
 ```
 
-### 9. Memory status
+### 10. Memory status
 - Path: `~/.claude/projects/{encoded-path}/memory/`
 - Count files in directory + lines in `MEMORY.md`
 
-### 10. Rate limit (Claude Code)
+### 11. Rate limit (Claude Code)
 
 NOT in transcript JSONL. Collected via StatusLine mechanism.
 
@@ -224,7 +234,7 @@ File format read by abtop:
 - Account-level metric, shared across all sessions.
 - Show "—" when not configured or data unavailable.
 
-### 11. Other files
+### 12. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
 - `~/.claude/history.jsonl` — prompt history with sessionId.
 
@@ -239,7 +249,7 @@ File format read by abtop:
 
 **Done detection**: session files are deleted on normal exit, but may linger briefly or survive crashes. When PID is dead but file exists, show as Done and clean up on next tick.
 
-**PID reuse risk**: verify PID is still the expected agent process (Claude, Codex, or OpenCode) by checking `ps -p {pid} -o command=`. Don't trust PID alone.
+**PID reuse risk**: verify PID is still the expected agent process (Claude, Codex, OpenCode, Cursor Agent, or Grok) by checking `ps -p {pid} -o command=`. Don't trust PID alone.
 
 Current task (2nd line under each session):
 - Working → last `tool_use` name + first arg (e.g. `Edit src/main.rs`)
@@ -359,6 +369,7 @@ cargo clippy                   # Lint
 - Gemini support
 - Cursor IDE Composer / ACP desktop sessions (Cursor Agent CLI is supported in this fork)
 - Cursor Agent account quota / invented token totals without a local source
+- Grok account quota row (no reliable local source)
 - Cost estimation
 - Remote/SSH monitoring
 - Notifications/alerts
@@ -399,14 +410,14 @@ abtop reads transcripts, prompts, tool inputs, and memory files. These may conta
 - **`--once` output**: redact file contents from tool_use inputs. Show tool name + file path only, not content.
 - **TUI mode**: show tool name + first arg (file path), never show file contents or prompt text in session list.
 - **No network**: abtop never sends data anywhere. All local reads.
-- **Exception**: summary generation calls `claude --print` locally (no network by abtop itself, but claude may use its API).
+- **Exception**: summary generation calls `claude --print` locally (no network by abtop itself, but claude may use its API). Grok sessions use `summary.json` `generated_title` and do not call `claude --print`.
 
 ## Gotchas
 
 - **Transcript size**: 1KB–18MB. On first load, full scan for totals. After that, track file offset and read only new bytes. Buffer partial lines.
 - **Session file deletion**: files disappear when Claude exits. Handle `NotFound` between scan and read.
 - **stats-cache.json is stale**: only updated on `/stats` command. Don't use for live data.
-- **Context window not in data**: must hardcode per model. Will break if Anthropic/OpenAI add new models.
+- **Context window not in data**: must hardcode per model. Will break if Anthropic/OpenAI add new models. Grok is the exception: read `signals.json` `contextWindowTokens` (the same model id can be 256k or 500k). `usage.json` and `signals.json` can be absent until a turn finishes.
 - **Rate limit is account-level**: shared across all sessions. Don't show per-session.
 - **Path encoding**: `/Users/foo/bar` → `-Users-foo-bar`. Used for transcript directory names.
 - **Path encoding collision**: `-Users-foo-bar-baz` could be `/Users/foo/bar-baz` or `/Users/foo-bar/baz`. Use session JSON's `cwd` as source of truth.
