@@ -32,6 +32,54 @@ with open(os.path.join(config_dir, 'abtop-rate-limits.json'), 'w') as f:
 " 2>/dev/null
 "#;
 
+const AGY_STATUSLINE_SCRIPT: &str = r#"#!/bin/bash
+# abtop StatusLine hook for Google Antigravity — writes rate limit data for abtop to read.
+# Installed by: abtop --setup
+# Reads JSON from stdin, writes ~/.gemini/antigravity-cli/abtop-rate-limits.json,
+# and chains to any previous user statusline script if present.
+INPUT=$(cat 2>/dev/null || true)
+if [ -n "$INPUT" ]; then
+    printf '%s' "$INPUT" | python3 -c "
+import sys, json, time, os
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+q = data.get('quota')
+if not isinstance(q, dict):
+    sys.exit(0)
+now = int(time.time())
+out = {'source': 'antigravity', 'updated_at': now}
+fh = q.get('gemini-5h') or q.get('3p-5h')
+if isinstance(fh, dict) and fh.get('remaining_fraction') is not None:
+    rem = float(fh['remaining_fraction'])
+    used = max(0.0, min(100.0, round((1.0 - rem) * 100.0, 1)))
+    rst = int(fh.get('reset_in_seconds') or 0)
+    out['five_hour'] = {'used_percentage': used, 'resets_at': (now + rst) if rst > 0 else 0, 'window_minutes': 300}
+wk = q.get('gemini-weekly') or q.get('3p-weekly')
+if isinstance(wk, dict) and wk.get('remaining_fraction') is not None:
+    rem = float(wk['remaining_fraction'])
+    used = max(0.0, min(100.0, round((1.0 - rem) * 100.0, 1)))
+    rst = int(wk.get('reset_in_seconds') or 0)
+    out['seven_day'] = {'used_percentage': used, 'resets_at': (now + rst) if rst > 0 else 0, 'window_minutes': 10080}
+if 'five_hour' in out or 'seven_day' in out:
+    agy_dir = os.path.join(os.path.expanduser('~'), '.gemini', 'antigravity-cli')
+    tmp = os.path.join(agy_dir, 'abtop-rate-limits.json.tmp')
+    dst = os.path.join(agy_dir, 'abtop-rate-limits.json')
+    with open(tmp, 'w') as f:
+        json.dump(out, f)
+    os.replace(tmp, dst)
+" 2>/dev/null &
+fi
+CHAIN_FILE="$HOME/.gemini/antigravity-cli/abtop-chained-statusline.txt"
+if [ -f "$CHAIN_FILE" ]; then
+    CHAIN_CMD=$(cat "$CHAIN_FILE" 2>/dev/null || true)
+    if [ -n "$CHAIN_CMD" ] && [ -x "$CHAIN_CMD" ]; then
+        printf '%s' "$INPUT" | "$CHAIN_CMD" "$@"
+    fi
+fi
+"#;
+
 fn claude_dir() -> PathBuf {
     std::env::var("CLAUDE_CONFIG_DIR")
         .ok()
@@ -48,8 +96,15 @@ fn settings_path() -> PathBuf {
     claude_dir().join("settings.json")
 }
 
+fn agy_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".gemini")
+        .join("antigravity-cli")
+}
+
 pub fn run_setup() {
-    println!("abtop --setup: configuring Claude Code StatusLine hook\n");
+    println!("abtop --setup: configuring StatusLine hooks\n");
 
     // Ensure ~/.claude directory exists
     let dir = claude_dir();
@@ -140,6 +195,81 @@ pub fn run_setup() {
         }
     }
 
-    println!("\n  done! rate limit data will appear in abtop after the next Claude response.");
-    println!("  restart any running Claude Code sessions to activate.");
+    // Step 3: Also configure Antigravity CLI if ~/.gemini/antigravity-cli exists
+    let agy = agy_dir();
+    if agy.is_dir() {
+        setup_antigravity(&agy);
+    }
+
+    println!("\n  done! rate limit data will appear in abtop after the next agent response.");
+    println!("  restart any running Claude Code / Antigravity sessions to activate.");
+}
+
+fn setup_antigravity(agy: &std::path::Path) {
+    let script = agy.join("abtop-statusline.sh");
+    if let Err(e) = fs::write(&script, AGY_STATUSLINE_SCRIPT) {
+        eprintln!("  ✗ failed to write {}: {}", script.display(), e);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o700));
+    }
+    println!("  ✓ wrote {}", script.display());
+
+    let settings_file = agy.join("settings.json");
+    let mut settings: Value = if settings_file.exists() {
+        fs::read_to_string(&settings_file)
+            .ok()
+            .and_then(|c| serde_json::from_str(content_or_empty(&c)).ok())
+            .unwrap_or_else(|| Value::Object(Default::default()))
+    } else {
+        Value::Object(Default::default())
+    };
+
+    let Some(obj) = settings.as_object_mut() else {
+        return;
+    };
+
+    let expected_cmd = script.display().to_string();
+    if let Some(existing_cmd) = obj
+        .get("statusLine")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("command"))
+        .and_then(|c| c.as_str())
+    {
+        if !existing_cmd.is_empty() && existing_cmd != expected_cmd {
+            // Preserve the user's existing statusline script by chaining to it
+            let chain_file = agy.join("abtop-chained-statusline.txt");
+            let _ = fs::write(&chain_file, existing_cmd);
+            println!(
+                "  ✓ chained existing Antigravity statusLine ({})",
+                existing_cmd
+            );
+        }
+    }
+
+    obj.insert(
+        "statusLine".to_string(),
+        serde_json::json!({
+            "type": "command",
+            "command": expected_cmd,
+            "enabled": true
+        }),
+    );
+
+    if let Ok(pretty) = serde_json::to_string_pretty(&settings) {
+        if fs::write(&settings_file, pretty).is_ok() {
+            println!("  ✓ updated {}", settings_file.display());
+        }
+    }
+}
+
+fn content_or_empty(s: &str) -> &str {
+    if s.trim().is_empty() {
+        "{}"
+    } else {
+        s
+    }
 }

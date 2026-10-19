@@ -1,3 +1,4 @@
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
@@ -6,6 +7,7 @@ pub mod opencode;
 pub mod process;
 pub mod rate_limit;
 
+pub use antigravity::AntigravityCollector;
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
 pub use cursor::CursorCollector;
@@ -146,8 +148,12 @@ pub(crate) fn context_window_for_model(
     configured_model: &str,
     max_context_tokens: u64,
 ) -> u64 {
+    let lower_tr = transcript_model.to_ascii_lowercase();
+    let lower_cfg = configured_model.to_ascii_lowercase();
     if transcript_model.contains("[1m]")
         || configured_model.contains("[1m]")
+        || lower_tr.contains("gemini")
+        || lower_cfg.contains("gemini")
         || max_context_tokens > 200_000
     {
         1_000_000
@@ -340,6 +346,9 @@ impl MultiCollector {
         if !is_hidden("cursor-agent") {
             collectors.push(Box::new(CursorCollector::new()));
         }
+        if !is_hidden("antigravity") {
+            collectors.push(Box::new(AntigravityCollector::new()));
+        }
         let codex_enabled = !is_hidden("codex");
         Self {
             collectors,
@@ -512,33 +521,33 @@ mod tests {
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
-        assert_eq!(mc.collectors.len(), 4);
+        assert_eq!(mc.collectors.len(), 5);
     }
 
     #[test]
     fn with_hidden_codex_drops_codex_only() {
         let mc = MultiCollector::with_hidden(&["codex".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 4);
     }
 
     #[test]
     fn with_hidden_is_case_insensitive() {
         let mc = MultiCollector::with_hidden(&["CODEX".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 4);
         let mc = MultiCollector::with_hidden(&["Claude".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 4);
     }
 
     #[test]
     fn with_hidden_unknown_names_are_ignored() {
         let mc = MultiCollector::with_hidden(&["kiro".to_string(), "gemini".to_string()]);
-        assert_eq!(mc.collectors.len(), 4);
+        assert_eq!(mc.collectors.len(), 5);
     }
 
     #[test]
     fn with_hidden_cursor_agent_drops_cursor_only() {
         let mc = MultiCollector::with_hidden(&["cursor-agent".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 4);
     }
 
     #[test]
@@ -548,6 +557,7 @@ mod tests {
             "codex".to_string(),
             "opencode".to_string(),
             "cursor-agent".to_string(),
+            "antigravity".to_string(),
         ]);
         assert!(mc.collectors.is_empty());
     }

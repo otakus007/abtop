@@ -514,6 +514,74 @@ pub fn populate_demo(app: &mut App) {
             config_root: "~/.local/share/opencode".into(),
             file_accesses: vec![],
         },
+        AgentSession {
+            agent_cli: "antigravity",
+            launch_surface: LaunchSurface::Cli,
+            pid: 9720,
+            session_id: "9f2bddf6-ece6-4f1c-85e6-3104bc077497".into(),
+            cwd: "/Users/demo/agent-runtime".into(),
+            project_name: "agent-runtime".into(),
+            started_at: now - 12 * 60 * 1000, // 12m ago
+            status: SessionStatus::Executing,
+            model: "Gemini 4 Argon".into(),
+            effort: String::new(),
+            context_percent: 24.0,
+            total_input_tokens: 18_500,
+            total_output_tokens: 4_200,
+            total_cache_read: 221_500,
+            total_cache_create: 0,
+            turn_count: 15,
+            current_tasks: vec!["Edit src/collector/antigravity.rs".into()],
+            mem_mb: 194,
+            version: String::new(),
+            git_branch: "feat/antigravity-support".into(),
+            git_added: 1,
+            git_modified: 5,
+            token_history: vec![
+                12000, 15000, 19000, 24000, 21000, 28000, 32000, 26000, 31000, 29000,
+            ],
+            context_history: vec![
+                20000, 48000, 79000, 112000, 145000, 178000, 210000, 240000,
+            ],
+            compaction_count: 0,
+            context_window: 1_000_000,
+            subagents: vec![SubAgent {
+                name: "Codebase Scout".into(),
+                status: "done".into(),
+                tokens: 14_800,
+            }],
+            mem_file_count: 2,
+            mem_line_count: 45,
+            children: vec![],
+            first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Add Antigravity CLI, App, and IDE support".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Implementing Antigravity collector with FD lock discovery and transcript parsing.".into(),
+                },
+            ],
+            initial_prompt: "Add Antigravity CLI, App, and IDE support".into(),
+            tool_calls: vec![
+                ToolCall {
+                    name: "Read".into(),
+                    arg: "src/collector/mod.rs".into(),
+                    duration_ms: 48,
+                },
+                ToolCall {
+                    name: "Edit".into(),
+                    arg: "src/collector/antigravity.rs".into(),
+                    duration_ms: 135,
+                },
+            ],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            config_root: "~/.gemini/antigravity-cli".into(),
+            file_accesses: vec![],
+        },
     ];
 
     // --- Summaries (pre-populated, no LLM calls) ---
@@ -537,6 +605,10 @@ pub fn populate_demo(app: &mut App) {
         "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
         "Terraform multi-region refactor".into(),
     );
+    app.summaries.insert(
+        "9f2bddf6-ece6-4f1c-85e6-3104bc077497".into(),
+        "Antigravity agent integration".into(),
+    );
 
     // --- Rate limits ---
     app.rate_limits = vec![
@@ -559,6 +631,16 @@ pub fn populate_demo(app: &mut App) {
             seven_day_resets_at: Some(now_secs() + 6 * 24 * 3600),
             seven_day_window_minutes: Some(10_080),
             updated_at: Some(now_secs() - 5),
+        },
+        RateLimitInfo {
+            source: "antigravity".into(),
+            five_hour_pct: Some(18.0),
+            five_hour_resets_at: Some(now_secs() + 2 * 3600),
+            five_hour_window_minutes: Some(300),
+            seven_day_pct: Some(8.0),
+            seven_day_resets_at: Some(now_secs() + 4 * 24 * 3600),
+            seven_day_window_minutes: Some(10_080),
+            updated_at: Some(now_secs() - 8),
         },
     ];
 
