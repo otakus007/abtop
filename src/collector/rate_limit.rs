@@ -30,9 +30,9 @@ struct WindowInfo {
     window_minutes: Option<u64>,
 }
 
-/// Read rate limit info from all known Claude config directories.
-/// Checks the default ~/.claude, CLAUDE_CONFIG_DIR if set, and any
-/// additional directories discovered from running Claude processes.
+/// Read rate limit info from all known Claude and Antigravity config directories.
+/// Checks the default ~/.claude, ~/.gemini/antigravity-cli, CLAUDE_CONFIG_DIR if set,
+/// and any additional directories discovered from running agent processes.
 pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -41,6 +41,7 @@ pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
     let mut dirs = Vec::new();
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(".claude"));
+        dirs.push(home.join(".gemini").join("antigravity-cli"));
     }
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         dirs.push(PathBuf::from(dir));
@@ -51,8 +52,17 @@ pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
         if !dir.is_dir() || !seen.insert(dir.clone()) {
             continue;
         }
+        let default_source = if dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("antigravity"))
+        {
+            "antigravity"
+        } else {
+            "claude"
+        };
         let path = dir.join(CLAUDE_RATE_FILE);
-        if let Some(info) = read_rate_file(&path, "claude") {
+        if let Some(info) = read_rate_file(&path, default_source) {
             results.push(info);
         }
     }

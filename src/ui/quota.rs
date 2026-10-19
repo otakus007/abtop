@@ -14,7 +14,7 @@ use super::{btop_block_active, fmt_tokens, grad_at, make_gradient, remaining_bar
 const STALE_SECS: u64 = 600;
 
 /// Fixed source order so columns stay stable across runs.
-const SOURCES: &[&str] = &["claude", "codex"];
+const SOURCES: &[&str] = &["claude", "codex", "antigravity"];
 
 pub(crate) fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     draw_quota_panel_active(f, app, area, theme, false);
@@ -45,7 +45,7 @@ pub(crate) fn draw_quota_panel_active(
     let ticks_per_min = 30usize;
     let tokens_per_min: f64 = rates.iter().rev().take(ticks_per_min).sum();
 
-    // Split into side-by-side columns: one per known source (CLAUDE | CODEX).
+    // Split into side-by-side columns: one per known source (CLAUDE | CODEX | ANTIGRAVITY).
     // Columns are always rendered so the panel layout stays stable even when a
     // source has no data yet.
     let num_sources = SOURCES.len() as u16;
@@ -96,6 +96,14 @@ pub(crate) fn draw_quota_panel_active(
     );
 }
 
+fn format_source_header(source: &str, col_w_usize: usize) -> String {
+    if source.eq_ignore_ascii_case("antigravity") && col_w_usize < 13 {
+        "AGY".to_string()
+    } else {
+        source.to_uppercase()
+    }
+}
+
 fn draw_source_column(
     f: &mut Frame,
     area: Rect,
@@ -106,9 +114,12 @@ fn draw_source_column(
 ) {
     let col_w_usize = area.width as usize;
     let bar_w = col_w_usize.saturating_sub(10).clamp(2, 8);
+    let header_title = format_source_header(source, col_w_usize);
 
     let Some(rl) = rl else {
-        let hint = if source.eq_ignore_ascii_case("claude") {
+        let hint = if source.eq_ignore_ascii_case("claude")
+            || source.eq_ignore_ascii_case("antigravity")
+        {
             t("quota.abtop_setup")
         } else {
             t("quota.run_codex")
@@ -116,7 +127,7 @@ fn draw_source_column(
         let no_data = t("quota.no_data");
         let lines = vec![
             Line::from(Span::styled(
-                format!(" {}", source.to_uppercase()),
+                format!(" {}", header_title),
                 Style::default()
                     .fg(theme.title)
                     .add_modifier(Modifier::BOLD),
@@ -154,7 +165,7 @@ fn draw_source_column(
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
-        format!(" {}", rl.source.to_uppercase()),
+        format!(" {}", format_source_header(&rl.source, col_w_usize)),
         Style::default()
             .fg(source_color)
             .add_modifier(Modifier::BOLD),

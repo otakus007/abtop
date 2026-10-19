@@ -1002,6 +1002,9 @@ fn is_supported_agent_command(cmd: &str) -> bool {
     crate::collector::process::cmd_has_binary(cmd, "claude")
         || crate::collector::process::cmd_has_binary(cmd, "codex")
         || crate::collector::process::cmd_has_binary(cmd, "opencode")
+        || crate::collector::process::cmd_has_binary(cmd, "agy")
+        || crate::collector::process::cmd_has_binary(cmd, "antigravity")
+        || crate::collector::process::cmd_has_binary(cmd, "antigravity-ide")
 }
 
 fn is_killable_agent_command(cmd: &str) -> bool {
@@ -1099,10 +1102,13 @@ mod tests {
     }
 
     #[test]
-    fn supported_agent_command_accepts_opencode() {
+    fn supported_agent_command_accepts_opencode_and_antigravity() {
         assert!(is_supported_agent_command("/usr/local/bin/claude"));
         assert!(is_supported_agent_command("codex --resume abc"));
         assert!(is_supported_agent_command("/opt/homebrew/bin/opencode"));
+        assert!(is_supported_agent_command("/home/user/.local/bin/agy"));
+        assert!(is_supported_agent_command("/Applications/Antigravity.app/Contents/MacOS/antigravity"));
+        assert!(is_supported_agent_command("/usr/bin/antigravity-ide"));
         assert!(!is_supported_agent_command("node server.js"));
     }
 
@@ -1110,6 +1116,7 @@ mod tests {
     fn killable_agent_command_rejects_codex_app_server() {
         assert!(is_killable_agent_command("codex --resume abc"));
         assert!(is_killable_agent_command("/usr/local/bin/claude"));
+        assert!(is_killable_agent_command("agy --resume 123"));
         assert!(!is_killable_agent_command(
             "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
         ));

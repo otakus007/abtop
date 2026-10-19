@@ -168,6 +168,11 @@ fn resolve_parent_cli(ppid: u32, process_info: &HashMap<u32, ProcInfo>) -> &'sta
         "claude"
     } else if process::cmd_has_binary(cmd, "codex") {
         "codex"
+    } else if process::cmd_has_binary(cmd, "agy")
+        || process::cmd_has_binary(cmd, "antigravity")
+        || process::cmd_has_binary(cmd, "antigravity-ide")
+    {
+        "antigravity"
     } else {
         "?"
     }

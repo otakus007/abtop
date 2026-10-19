@@ -137,6 +137,7 @@ pub(crate) fn draw_sessions_panel_active(
             "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
             "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
             "opencode" => ("#OC", Color::Rgb(74, 222, 128)), // #4ADE80 emerald
+            "antigravity" => ("*AG", Color::Rgb(56, 189, 248)), // #38BDF8 sky blue
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (
@@ -158,7 +159,8 @@ pub(crate) fn draw_sessions_panel_active(
             crate::model::SessionStatus::Done => (t("sess.done"), theme.inactive_fg),
         };
 
-        let is_1m = session.context_window >= 1_000_000 || session.model.contains("[1m]");
+        let is_1m = (session.context_window >= 1_000_000 && session.agent_cli == "claude")
+            || session.model.contains("[1m]");
         let model_short = shorten_model(&session.model, is_1m);
         let ctx_color = grad_at(&proc_grad, session.context_percent);
 
@@ -992,6 +994,24 @@ fn task_row_text(task_text: &str, max_width: usize) -> String {
 }
 
 pub(crate) fn shorten_model(model: &str, is_1m: bool) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("gemini ") {
+        let compact = rest
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-");
+        let base = format!("g{compact}");
+        return if is_1m { format!("{base}[1m]") } else { base };
+    }
+    if let Some(rest) = lower.strip_prefix("gemini-") {
+        let compact = rest
+            .replace("-pro", "p")
+            .replace("-flash-lite", "fl")
+            .replace("-flash", "f");
+        let base = format!("g{compact}");
+        return if is_1m { format!("{base}[1m]") } else { base };
+    }
+
     // "claude-opus-4-6" → "opus4.6", "claude-sonnet-4-6" → "sonnet4.6", "claude-haiku-4-5" → "haiku4.5"
     let s = model.strip_prefix("claude-").unwrap_or(model);
     let s = s.trim_end_matches("[1m]");
