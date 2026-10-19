@@ -369,6 +369,7 @@ cargo clippy                   # Lint
 - Gemini support
 - Cursor IDE Composer / ACP desktop sessions (Cursor Agent CLI is supported in this fork)
 - Cursor Agent account quota / invented token totals without a local source
+- Grok account quota row (no reliable local source)
 - Cost estimation
 - Remote/SSH monitoring
 - Notifications/alerts
