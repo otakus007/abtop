@@ -2,7 +2,7 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code, Codex CLI, and OpenCode sessions.
+Supports Claude Code, Codex CLI, OpenCode, and Cursor Agent CLI (`cursor-agent`) sessions.
 
 ## Language Policy
 
@@ -29,6 +29,7 @@ src/
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
+│   ├── cursor.rs           # Cursor Agent CLI: ps + chat store.db fds + transcript JSONL
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
 │   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
 └── model/
@@ -76,7 +77,7 @@ Panel rendering priority (top to bottom):
 
 Panel descriptions:
 - **¹context**: Left = token rate braille sparkline (200-point history). Right = per-session context % bars with yellow/red warning.
-- **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
+- **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add OpenCode or Cursor Agent rows unless those tools expose a reliable account-level provider rate-limit source.
 - **³tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
 - **projects** (always visible): Per-project git branch + added/modified file counts.
 - **⁴ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
@@ -173,11 +174,20 @@ Rate limits extracted from `token_count` events:
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
 
-### 5. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
+### 5. Cursor Agent CLI: `~/.cursor/chats/` + `agent-transcripts`
+- Discover running `cursor-agent` processes via shared `ps` data. Match the `cursor-agent` binary only — never a bare `agent` command (can be an unrelated CLI). Exclude `worker-server` children.
+- Map PID → open `~/.cursor/chats/{hash}/{sessionId}/store.db` (or `-wal`/`-shm`) via `/proc` fds (Linux) or `lsof`. Do not parse encrypted `store.db` blobs.
+- Read sibling `meta.json` for `cwd`, `title`, `createdAtMs`, `updatedAtMs`.
+- Parse `~/.cursor/projects/{encoded-cwd}/agent-transcripts/{sessionId}/{sessionId}.jsonl` for tools/status/prompts. Path encoding: `/mnt/sk/repos/abtop` → `mnt-sk-repos-abtop`.
+- Fallback when FD mapping misses: scan recent chat `meta.json` files and match process cwd (one chat per PID).
+- Cursor Agent contributes session/project/port/task data, but not quota or reliable token/context totals. Quota remains Claude + Codex only.
+- Hide with `hidden_agents = ["cursor-agent"]`.
+
+### 6. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
 - `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
 
-### 6. Process tree: `ps` + `lsof`
+### 7. Process tree: `ps` + `lsof`
 ```bash
 ps -eo pid,ppid,rss,%cpu,command    # All processes
 lsof -i -P -n -sTCP:LISTEN         # Open ports
@@ -185,16 +195,16 @@ lsof -i -P -n -sTCP:LISTEN         # Open ports
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
 
-### 7. Git status per project
+### 8. Git status per project
 ```bash
 git -C {cwd} status --porcelain     # added/modified file counts
 ```
 
-### 8. Memory status
+### 9. Memory status
 - Path: `~/.claude/projects/{encoded-path}/memory/`
 - Count files in directory + lines in `MEMORY.md`
 
-### 9. Rate limit (Claude Code)
+### 10. Rate limit (Claude Code)
 
 NOT in transcript JSONL. Collected via StatusLine mechanism.
 
@@ -214,7 +224,7 @@ File format read by abtop:
 - Account-level metric, shared across all sessions.
 - Show "—" when not configured or data unavailable.
 
-### 10. Other files
+### 11. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
 - `~/.claude/history.jsonl` — prompt history with sessionId.
 
@@ -346,7 +356,9 @@ cargo clippy                   # Lint
 
 ## Non-Goals (v0.1)
 
-- Gemini/Cursor support
+- Gemini support
+- Cursor IDE Composer / ACP desktop sessions (Cursor Agent CLI is supported in this fork)
+- Cursor Agent account quota / invented token totals without a local source
 - Cost estimation
 - Remote/SSH monitoring
 - Notifications/alerts

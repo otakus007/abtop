@@ -2,8 +2,8 @@
 
 **Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
-See every Claude Code, Codex CLI, and OpenCode session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
-Claude Code, Codex CLI, and OpenCode sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
+See every Claude Code, Codex CLI, OpenCode, and Cursor Agent CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+Sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
@@ -75,20 +75,22 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI | OpenCode |
-| ----------------- | :---------: | :-------: | :------: |
-| Session Discovery |     ✅      |    ✅     |    ✅    |
-| Token Tracking    |     ✅      |    ✅     |    ✅    |
-| Context Window %  |     ✅      |    ✅     |    ❌    |
-| Status Detection  |     ✅      |    ✅     |    ✅    |
-| Current Task      |     ✅      |    ✅     |    ❌    |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |
-| Git Status        |     ✅      |    ✅     |    ✅    |
-| Children / Ports  |     ✅      |    ✅     |    ✅    |
-| Subagents         |     ✅      |    ❌     |    ❌    |
-| Memory Status     |     ✅      |    ❌     |    ❌    |
+| Feature           | Claude Code | Codex CLI | OpenCode | Cursor Agent |
+| ----------------- | :---------: | :-------: | :------: | :----------: |
+| Session Discovery |     ✅      |    ✅     |    ✅    |      ✅      |
+| Token Tracking    |     ✅      |    ✅     |    ✅    |      ❌      |
+| Context Window %  |     ✅      |    ✅     |    ❌    |      ❌      |
+| Status Detection  |     ✅      |    ✅     |    ✅    |      ✅      |
+| Current Task      |     ✅      |    ✅     |    ❌    |      ✅      |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |      ❌      |
+| Git Status        |     ✅      |    ✅     |    ✅    |      ✅      |
+| Children / Ports  |     ✅      |    ✅     |    ✅    |      ✅      |
+| Subagents         |     ✅      |    ❌     |    ❌    |      ❌      |
+| Memory Status     |     ✅      |    ❌     |    ❌    |      ❌      |
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
+
+Cursor Agent CLI (`cursor-agent`) support discovers live processes, maps open `~/.cursor/chats/.../store.db` files, and reads sibling `meta.json` plus `~/.cursor/projects/.../agent-transcripts/.../*.jsonl`. Match the `cursor-agent` binary only (not a bare `agent` command). Token totals, context %, and account quota are not available from local files today — those cells stay empty/`—`. Hide with `hidden_agents = ["cursor-agent"]`.
 
 ## Themes
 
