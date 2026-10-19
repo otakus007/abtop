@@ -2,6 +2,7 @@ pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub mod grok;
 pub mod mcp;
 pub mod opencode;
 pub mod process;
@@ -11,6 +12,7 @@ pub use antigravity::AntigravityCollector;
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
 pub use cursor::CursorCollector;
+pub use grok::GrokCollector;
 pub use mcp::McpServer;
 pub use opencode::OpenCodeCollector;
 pub use rate_limit::read_rate_limits;
@@ -349,6 +351,9 @@ impl MultiCollector {
         if !is_hidden("antigravity") {
             collectors.push(Box::new(AntigravityCollector::new()));
         }
+        if !is_hidden("grok") {
+            collectors.push(Box::new(GrokCollector::new()));
+        }
         let codex_enabled = !is_hidden("codex");
         Self {
             collectors,
@@ -521,33 +526,39 @@ mod tests {
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
-        assert_eq!(mc.collectors.len(), 5);
+        assert_eq!(mc.collectors.len(), 6);
     }
 
     #[test]
     fn with_hidden_codex_drops_codex_only() {
         let mc = MultiCollector::with_hidden(&["codex".to_string()]);
-        assert_eq!(mc.collectors.len(), 4);
+        assert_eq!(mc.collectors.len(), 5);
     }
 
     #[test]
     fn with_hidden_is_case_insensitive() {
         let mc = MultiCollector::with_hidden(&["CODEX".to_string()]);
-        assert_eq!(mc.collectors.len(), 4);
+        assert_eq!(mc.collectors.len(), 5);
         let mc = MultiCollector::with_hidden(&["Claude".to_string()]);
-        assert_eq!(mc.collectors.len(), 4);
+        assert_eq!(mc.collectors.len(), 5);
     }
 
     #[test]
     fn with_hidden_unknown_names_are_ignored() {
         let mc = MultiCollector::with_hidden(&["kiro".to_string(), "gemini".to_string()]);
-        assert_eq!(mc.collectors.len(), 5);
+        assert_eq!(mc.collectors.len(), 6);
     }
 
     #[test]
     fn with_hidden_cursor_agent_drops_cursor_only() {
         let mc = MultiCollector::with_hidden(&["cursor-agent".to_string()]);
-        assert_eq!(mc.collectors.len(), 4);
+        assert_eq!(mc.collectors.len(), 5);
+    }
+
+    #[test]
+    fn with_hidden_grok_drops_grok_only() {
+        let mc = MultiCollector::with_hidden(&["grok".to_string()]);
+        assert_eq!(mc.collectors.len(), 5);
     }
 
     #[test]
@@ -558,6 +569,7 @@ mod tests {
             "opencode".to_string(),
             "cursor-agent".to_string(),
             "antigravity".to_string(),
+            "grok".to_string(),
         ]);
         assert!(mc.collectors.is_empty());
     }

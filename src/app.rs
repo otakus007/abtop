@@ -580,6 +580,18 @@ impl App {
                 .copied()
                 .unwrap_or(0);
             let has_input = !s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty();
+            if s.agent_cli == "grok" && !s.initial_prompt.is_empty() {
+                // Grok already stores a generated title. Do not send it to
+                // `claude --print`.
+                if !self.summaries.contains_key(&s.session_id) {
+                    self.summaries.insert(
+                        s.session_id.clone(),
+                        sanitize_fallback(&s.initial_prompt, 80),
+                    );
+                    save_summary_cache(&self.summaries);
+                }
+                continue;
+            }
             if has_input
                 && !self.summaries.contains_key(&s.session_id)
                 && !self.pending_summaries.contains(&s.session_id)
@@ -1005,6 +1017,7 @@ fn is_supported_agent_command(cmd: &str) -> bool {
         || crate::collector::process::cmd_has_binary(cmd, "agy")
         || crate::collector::process::cmd_has_binary(cmd, "antigravity")
         || crate::collector::process::cmd_has_binary(cmd, "antigravity-ide")
+        || crate::collector::process::cmd_has_binary(cmd, "grok")
 }
 
 fn is_killable_agent_command(cmd: &str) -> bool {
@@ -1109,6 +1122,7 @@ mod tests {
         assert!(is_supported_agent_command("/home/user/.local/bin/agy"));
         assert!(is_supported_agent_command("/Applications/Antigravity.app/Contents/MacOS/antigravity"));
         assert!(is_supported_agent_command("/usr/bin/antigravity-ide"));
+        assert!(is_supported_agent_command("/home/tuannh/.grok/bin/grok"));
         assert!(!is_supported_agent_command("node server.js"));
     }
 

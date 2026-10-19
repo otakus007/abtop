@@ -85,10 +85,10 @@ pub struct SubAgentView {
 /// A single session, flattened and curated for JSON consumers.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionView {
-    /// Owning CLI: "claude", "codex", "opencode", "cursor-agent".
+    /// Owning CLI: "claude", "codex", "opencode", "cursor-agent", "antigravity", "grok".
     pub agent_cli: &'static str,
     /// Which surface launched this session (CLI / Claude desktop app / IDE
-    /// extension); always `Cli` for Codex, OpenCode, and Cursor Agent CLI.
+    /// extension); always `Cli` for Codex, OpenCode, Cursor Agent CLI, and Grok.
     pub launch_surface: LaunchSurface,
     /// OS process id of the agent CLI for this session.
     pub pid: u32,
