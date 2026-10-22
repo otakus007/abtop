@@ -1,12 +1,12 @@
 [package]
 name = "abtop"
-version = "0.5.5"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.88"
 description = "AI agent monitor for your terminal"
 license = "MIT"
-repository = "https://github.com/graykode/abtop"
-homepage = "https://github.com/graykode/abtop"
+repository = "https://github.com/otakus007/abtop"
+homepage = "https://github.com/otakus007/abtop"
 keywords = ["tui", "monitor", "claude", "ai", "agent"]
 categories = ["command-line-utilities"]
 readme = "README.md"
