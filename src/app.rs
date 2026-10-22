@@ -1014,6 +1014,7 @@ fn is_supported_agent_command(cmd: &str) -> bool {
     crate::collector::process::cmd_has_binary(cmd, "claude")
         || crate::collector::process::cmd_has_binary(cmd, "codex")
         || crate::collector::process::cmd_has_binary(cmd, "opencode")
+        || crate::collector::process::cmd_has_binary(cmd, "cursor-agent")
         || crate::collector::process::cmd_has_binary(cmd, "agy")
         || crate::collector::process::cmd_has_binary(cmd, "antigravity")
         || crate::collector::process::cmd_has_binary(cmd, "antigravity-ide")

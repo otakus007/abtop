@@ -123,7 +123,12 @@ impl AntigravityCollector {
         let mut pid_cwds: HashMap<u32, String> = HashMap::new();
 
         for &pid in &agy_pids {
-            let open_convs = discover_pid_conversations(pid);
+            let mut open_convs = discover_pid_conversations(pid);
+            if let Some(info) = shared.process_info.get(&pid) {
+                for cid in extract_conv_ids_from_command(&info.command) {
+                    open_convs.insert(cid);
+                }
+            }
             for cid in &open_convs {
                 conv_to_pid.entry(cid.clone()).or_insert(pid);
             }
@@ -156,12 +161,15 @@ impl AntigravityCollector {
                 continue;
             };
 
+            let mut matched_rows: Vec<(&DbSummaryRow, u32)> = Vec::new();
+            let mut matched_row_ids: HashSet<String> = HashSet::new();
+
             for row in &root_cache.sessions {
                 if row.killed || seen_conv_ids.contains(&row.conversation_id) {
                     continue;
                 }
 
-                // 1. Exact match via presence/<uuid>.lock or conversations/<uuid>.db FD
+                // 1. Exact match via presence/<uuid>.lock, conversations/<uuid>.db FD, or --conversation
                 let matched_pid = if let Some(&pid) = conv_to_pid.get(&row.conversation_id) {
                     Some(pid)
                 } else {
@@ -175,10 +183,38 @@ impl AntigravityCollector {
                     )
                 };
 
-                let Some(pid) = matched_pid else {
-                    continue;
-                };
+                if let Some(pid) = matched_pid {
+                    matched_row_ids.insert(row.conversation_id.clone());
+                    matched_rows.push((row, pid));
+                }
+            }
 
+            // 3. Fallback for remaining unclaimed processes belonging to this launch surface
+            // (e.g. on Windows when open-file FDs are unavailable and process cwd differs from workspace_cwd).
+            for &pid in &agy_pids {
+                if claimed_pids.contains(&pid) {
+                    continue;
+                }
+                let pid_surface = shared
+                    .process_info
+                    .get(&pid)
+                    .map(|p| detect_launch_surface(&p.command, LaunchSurface::Cli))
+                    .unwrap_or(LaunchSurface::Cli);
+                if pid_surface != *default_surface {
+                    continue;
+                }
+                if let Some(row) = root_cache.sessions.iter().find(|r| {
+                    !r.killed
+                        && !seen_conv_ids.contains(&r.conversation_id)
+                        && !matched_row_ids.contains(&r.conversation_id)
+                }) {
+                    claimed_pids.insert(pid);
+                    matched_row_ids.insert(row.conversation_id.clone());
+                    matched_rows.push((row, pid));
+                }
+            }
+
+            for (row, pid) in matched_rows {
                 seen_conv_ids.insert(row.conversation_id.clone());
 
                 let proc_info = shared.process_info.get(&pid);
@@ -523,12 +559,38 @@ impl AntigravityCollector {
             let default_model = read_default_model(&root_dir);
             let cli_version = read_cli_version(&root_dir);
             let db_path = root_dir.join("conversation_summaries.db");
-            let (sessions, subagents_by_parent) =
+            let (mut sessions, mut subagents_by_parent) =
                 if has_sqlite && db_path.exists() && !is_symlink(&db_path) {
                     query_summaries_db(&db_path).unwrap_or_default()
                 } else {
                     (Vec::new(), HashMap::new())
                 };
+            // Supplement or fall back to history.jsonl + brain/ transcripts when sqlite3 is
+            // unavailable (common on Windows) or when brand-new conversations are not yet in SQLite.
+            let (fb_sessions, fb_subagents) = fallback_summaries_from_files(&root_dir);
+            if sessions.is_empty() {
+                sessions = fb_sessions;
+            } else {
+                let existing: HashSet<String> =
+                    sessions.iter().map(|r| r.conversation_id.clone()).collect();
+                for fb in fb_sessions {
+                    if !existing.contains(&fb.conversation_id) {
+                        sessions.push(fb);
+                    }
+                }
+                sessions.sort_by_key(|r| std::cmp::Reverse(r.last_modified_ms));
+                sessions.truncate(MAX_SESSIONS as usize);
+            }
+            for (parent_id, fb_subs) in fb_subagents {
+                let entry = subagents_by_parent.entry(parent_id).or_default();
+                let existing_subs: HashSet<String> =
+                    entry.iter().map(|r| r.conversation_id.clone()).collect();
+                for sub in fb_subs {
+                    if !existing_subs.contains(&sub.conversation_id) {
+                        entry.push(sub);
+                    }
+                }
+            }
             self.cached_db_state.insert(
                 root_dir,
                 CachedRootDb {
@@ -613,15 +675,17 @@ impl AntigravityCollector {
 
     fn find_antigravity_pids(process_info: &HashMap<u32, process::ProcInfo>) -> Vec<u32> {
         let self_pid = std::process::id();
-        process_info
+        let candidates: HashSet<u32> = process_info
             .iter()
             .filter(|(&pid, info)| {
                 if pid == self_pid || info.command.contains("grep") {
                     return false;
                 }
-                // Ignore statusline helper scripts spawned by agy
+                // Ignore statusline helper scripts spawned by agy and Electron child helpers
                 if info.command.contains("statusline.sh")
                     || info.command.contains("abtop-statusline.sh")
+                    || info.command.contains("--type=")
+                    || info.command.contains("--crashpad-handler-pid=")
                 {
                     return false;
                 }
@@ -630,7 +694,32 @@ impl AntigravityCollector {
                     || process::cmd_has_binary(&info.command, "antigravity-ide")
             })
             .map(|(&pid, _)| pid)
-            .collect()
+            .collect();
+
+        // Deduplicate wrapper/child pairs (e.g. on Windows when a launcher stub spawns the real
+        // binary) by keeping leaf CLI processes and root App/IDE processes.
+        let mut pids: Vec<u32> = candidates
+            .iter()
+            .copied()
+            .filter(|&pid| {
+                let Some(info) = process_info.get(&pid) else {
+                    return true;
+                };
+                // If this process has a child that is also an Antigravity CLI candidate, prefer the child.
+                let has_candidate_child = candidates.iter().any(|&other| {
+                    other != pid
+                        && process_info
+                            .get(&other)
+                            .is_some_and(|oinfo| oinfo.ppid == pid)
+                });
+                if has_candidate_child && process::cmd_has_binary(&info.command, "agy") {
+                    return false;
+                }
+                true
+            })
+            .collect();
+        pids.sort_unstable();
+        pids
     }
 
     fn match_unclaimed_pid_by_cwd(
@@ -786,7 +875,218 @@ fn is_uuid_like(s: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
+/// Extract conversation UUIDs passed on the command line (e.g. `agy --conversation <uuid>`
+/// or `--resume <uuid>`).
+pub(crate) fn extract_conv_ids_from_command(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].trim_matches(|c| c == '"' || c == '\'');
+        if matches!(tok, "--conversation" | "--resume" | "-c") {
+            if let Some(next) = tokens.get(i + 1) {
+                let candidate = next.trim_matches(|c| c == '"' || c == '\'');
+                if is_uuid_like(candidate) {
+                    out.push(candidate.to_string());
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(val) = tok
+            .strip_prefix("--conversation=")
+            .or_else(|| tok.strip_prefix("--resume="))
+        {
+            let candidate = val.trim_matches(|c| c == '"' || c == '\'');
+            if is_uuid_like(candidate) {
+                out.push(candidate.to_string());
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 type SummaryQueryResult = (Vec<DbSummaryRow>, HashMap<String, Vec<DbSummaryRow>>);
+
+/// Pure-Rust fallback for session & subagent discovery when `sqlite3` is unavailable
+/// (standard on Windows) or when `conversation_summaries.db` is locked/incomplete.
+/// Combines `<root>/history.jsonl` and `<root>/brain/<uuid>/.system_generated/logs/transcript.jsonl`.
+fn fallback_summaries_from_files(root_dir: &Path) -> SummaryQueryResult {
+    let mut by_id: HashMap<String, DbSummaryRow> = HashMap::new();
+    let mut subagents_by_parent: HashMap<String, Vec<DbSummaryRow>> = HashMap::new();
+
+    // 1. Parse history.jsonl (contains top-level CLI prompts with workspace & conversationId)
+    let history_path = root_dir.join("history.jsonl");
+    if let Ok(text) = fs::read_to_string(&history_path) {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            let Some(cid) = val["conversationId"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| is_uuid_like(s))
+            else {
+                continue;
+            };
+            let ts = val["timestamp"].as_u64().unwrap_or(0);
+            let display = sanitize_field(val["display"].as_str().unwrap_or(""), 512, true);
+            let raw_ws = val["workspace"].as_str().unwrap_or("").trim();
+            let workspace_cwd = if raw_ws.starts_with("file://") {
+                decode_file_uri(raw_ws)
+            } else {
+                raw_ws.to_string()
+            };
+
+            let entry = by_id.entry(cid.to_string()).or_insert_with(|| DbSummaryRow {
+                conversation_id: cid.to_string(),
+                title: display.clone(),
+                step_count: 0,
+                last_modified_ms: ts,
+                last_user_input_ms: ts,
+                workspace_cwd: workspace_cwd.clone(),
+                status: String::new(),
+                agent_name: String::new(),
+                parent_conversation_id: String::new(),
+                not_fully_idle: false,
+                killed: false,
+            });
+            entry.step_count = entry.step_count.saturating_add(1);
+            if entry.title.is_empty() && !display.is_empty() {
+                entry.title = display;
+            }
+            if entry.workspace_cwd.is_empty() && !workspace_cwd.is_empty() {
+                entry.workspace_cwd = workspace_cwd;
+            }
+            if ts > entry.last_user_input_ms {
+                entry.last_user_input_ms = ts;
+            }
+            if ts > entry.last_modified_ms {
+                entry.last_modified_ms = ts;
+            }
+        }
+    }
+
+    // 2. Scan brain/<uuid>/.system_generated/logs/transcript.jsonl for mtime, subagents,
+    //    and App/IDE conversations not recorded in history.jsonl.
+    let brain_root = root_dir.join("brain");
+    if let Ok(entries) = fs::read_dir(&brain_root) {
+        let mut brain_candidates: Vec<(u64, String, PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !is_uuid_like(name) {
+                continue;
+            }
+            let tr_path = path
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl");
+            let mtime_ms = fs::metadata(&tr_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if mtime_ms > 0 {
+                brain_candidates.push((mtime_ms, name.to_string(), tr_path));
+            }
+        }
+        brain_candidates.sort_by_key(|(mtime, _, _)| std::cmp::Reverse(*mtime));
+        let max_scan = (MAX_SESSIONS + MAX_SUBAGENTS) as usize;
+        for (mtime_ms, cid, tr_path) in brain_candidates.into_iter().take(max_scan) {
+            if let Some(existing) = by_id.get_mut(&cid) {
+                if mtime_ms > existing.last_modified_ms {
+                    existing.last_modified_ms = mtime_ms;
+                }
+                continue;
+            }
+            let first_line = read_first_line(&tr_path);
+            let Ok(val) = serde_json::from_str::<Value>(&first_line) else {
+                continue;
+            };
+            let step_type = val["type"].as_str().unwrap_or("");
+            let content = val["content"].as_str().unwrap_or("");
+            let created_ms = parse_timestamp_ms(val["created_at"].as_str().unwrap_or(""));
+            if step_type == "SYSTEM_MESSAGE" {
+                if let Some(parent_id) = extract_subagent_sender(content) {
+                    subagents_by_parent
+                        .entry(parent_id.clone())
+                        .or_default()
+                        .push(DbSummaryRow {
+                            conversation_id: cid,
+                            title: String::new(),
+                            step_count: 1,
+                            last_modified_ms: mtime_ms.max(created_ms),
+                            last_user_input_ms: created_ms,
+                            workspace_cwd: String::new(),
+                            status: String::new(),
+                            agent_name: "subagent".to_string(),
+                            parent_conversation_id: parent_id,
+                            not_fully_idle: false,
+                            killed: false,
+                        });
+                }
+                continue;
+            }
+            let title = extract_user_request(content)
+                .map(|s| sanitize_field(&s, 512, true))
+                .unwrap_or_default();
+            by_id.insert(
+                cid.clone(),
+                DbSummaryRow {
+                    conversation_id: cid,
+                    title,
+                    step_count: 1,
+                    last_modified_ms: mtime_ms.max(created_ms),
+                    last_user_input_ms: created_ms,
+                    workspace_cwd: String::new(),
+                    status: String::new(),
+                    agent_name: String::new(),
+                    parent_conversation_id: String::new(),
+                    not_fully_idle: false,
+                    killed: false,
+                },
+            );
+        }
+    }
+
+    let mut sessions: Vec<DbSummaryRow> = by_id.into_values().collect();
+    sessions.sort_by_key(|r| std::cmp::Reverse(r.last_modified_ms));
+    sessions.truncate(MAX_SESSIONS as usize);
+    (sessions, subagents_by_parent)
+}
+
+fn read_first_line(path: &Path) -> String {
+    let Ok(mut f) = File::open(path) else {
+        return String::new();
+    };
+    let mut buf = [0u8; 8192];
+    let Ok(n) = f.read(&mut buf) else {
+        return String::new();
+    };
+    let s = String::from_utf8_lossy(&buf[..n]);
+    s.lines().next().unwrap_or("").trim().to_string()
+}
+
+fn extract_subagent_sender(content: &str) -> Option<String> {
+    let marker = "sender=";
+    let pos = content.find(marker)?;
+    let rest = &content[pos + marker.len()..];
+    let token = rest.split_whitespace().next()?;
+    if is_uuid_like(token) {
+        Some(token.to_string())
+    } else {
+        None
+    }
+}
 
 fn query_summaries_db(db_path: &Path) -> Option<SummaryQueryResult> {
     let top_sql = format!(
@@ -1473,5 +1773,60 @@ mod tests {
         apply_transcript_line(&mut entry, generic_line);
         assert_eq!(entry.tool_calls[0].duration_ms, 3000);
         assert_eq!(entry.pending_since_ms, 0);
+    }
+
+    #[test]
+    fn extract_conv_ids_from_command_parses_flags() {
+        let cmd = r#""C:\Users\u\AppData\Local\Programs\Antigravity\agy.exe" --dangerously-skip-permissions --conversation e6f434ca-cf90-4d7b-8095-2b3392284630"#;
+        assert_eq!(
+            extract_conv_ids_from_command(cmd),
+            vec!["e6f434ca-cf90-4d7b-8095-2b3392284630".to_string()]
+        );
+    }
+
+    #[test]
+    fn fallback_summaries_from_files_works_without_sqlite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cid = "f153b0b3-e649-4f52-8559-c8c0443ab3c7";
+        let sub_id = "98cbde3f-b300-4412-9180-f4c65d6a2596";
+
+        fs::write(
+            root.join("history.jsonl"),
+            format!(
+                r#"{{"display":"Fix Windows agent detection","timestamp":1792663956094,"workspace":"C:\\Users\\u\\repos\\abtop","conversationId":"{cid}"}}"#
+            ),
+        )
+        .unwrap();
+
+        let tr_dir = root.join("brain").join(cid).join(".system_generated").join("logs");
+        fs::create_dir_all(&tr_dir).unwrap();
+        fs::write(
+            tr_dir.join("transcript.jsonl"),
+            r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-10-22T08:27:28Z","content":"<USER_REQUEST>\nFix Windows agent detection\n</USER_REQUEST>"}"#,
+        )
+        .unwrap();
+
+        let sub_dir = root
+            .join("brain")
+            .join(sub_id)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(
+            sub_dir.join("transcript.jsonl"),
+            format!(
+                r#"{{"step_index":0,"type":"SYSTEM_MESSAGE","created_at":"2026-10-22T08:35:58Z","content":"[Message] timestamp=2026-10-22T08:35:58Z sender={cid} priority=HIGH content=test"}}"#
+            ),
+        )
+        .unwrap();
+
+        let (sessions, subagents) = fallback_summaries_from_files(root);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].conversation_id, cid);
+        assert_eq!(sessions[0].workspace_cwd, r"C:\Users\u\repos\abtop");
+        assert_eq!(sessions[0].title, "Fix Windows agent detection");
+        assert_eq!(subagents.get(cid).map(|v| v.len()), Some(1));
+        assert_eq!(subagents[cid][0].conversation_id, sub_id);
     }
 }

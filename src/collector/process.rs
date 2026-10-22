@@ -147,7 +147,14 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
             proc_
                 .cmd()
                 .iter()
-                .map(|s| s.to_string_lossy().into_owned())
+                .map(|s| {
+                    let arg = s.to_string_lossy();
+                    if arg.contains(char::is_whitespace) && !arg.starts_with('"') {
+                        format!("\"{arg}\"")
+                    } else {
+                        arg.into_owned()
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         };
@@ -418,23 +425,56 @@ pub fn cmd_first_token_has_binary(cmd: &str, name: &str) -> bool {
 
 #[cfg(not(windows))]
 fn unix_token_has_binary(tok: &str, name: &str) -> bool {
-    let mut iter = tok.rsplit('/');
-    let base = iter.next().unwrap_or(tok);
+    let segments: Vec<&str> = tok.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(&raw_base) = segments.last() else {
+        return false;
+    };
+    if raw_base == name {
+        return true;
+    }
+    let base = raw_base
+        .strip_suffix(".exe")
+        .or_else(|| raw_base.strip_suffix(".js"))
+        .or_else(|| raw_base.strip_suffix(".mjs"))
+        .or_else(|| raw_base.strip_suffix(".cjs"))
+        .or_else(|| raw_base.strip_suffix(".sh"))
+        .or_else(|| raw_base.strip_suffix(".py"))
+        .unwrap_or(raw_base);
     if base == name {
         return true;
     }
-    // Strip .exe suffix for compatibility with claude.exe on non-Windows (e.g. @anthropic-ai/claude-code npm package)
-    if let Some(stripped) = base.strip_suffix(".exe") {
-        if stripped == name {
-            return true;
-        }
+    if name == "grok" && is_grok_platform_binary(base) {
+        return true;
     }
-    matches!((iter.next(), iter.next()), (Some("versions"), Some(parent)) if parent == name)
+    if segments.len() >= 3
+        && segments[segments.len() - 2] == "versions"
+        && segments[segments.len() - 3] == name
+    {
+        return true;
+    }
+    if matches!(base, "node" | "index" | "cli" | "main" | "bundle")
+        && segments[..segments.len() - 1].contains(&name)
+    {
+        return true;
+    }
+    false
+}
+
+fn is_grok_platform_binary(base: &str) -> bool {
+    let lower = base.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("grok-") else {
+        return false;
+    };
+    rest.starts_with(|c: char| c.is_ascii_digit())
+        || rest.starts_with("windows")
+        || rest.starts_with("linux")
+        || rest.starts_with("darwin")
+        || rest.starts_with("macos")
 }
 
 /// Windows variant: checks executable-position tokens, splits on `\`, strips a
-/// trailing `.exe` and common script extensions (`.js`, `.sh`, `.py`), and
-/// matches case-insensitively.
+/// trailing `.exe` and common script/wrapper extensions, and matches
+/// case-insensitively.
 /// Kept separate from the unix impl so non-Windows matching stays exact
 /// (`Claude` must not match `claude` on linux/macOS).
 #[cfg(windows)]
@@ -452,27 +492,57 @@ pub fn cmd_first_token_has_binary(cmd: &str, name: &str) -> bool {
         .is_some_and(|tok| windows_token_has_binary(tok, name))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+fn strip_windows_ext(base: &str) -> &str {
+    for ext in [
+        ".exe", ".cmd", ".bat", ".ps1", ".js", ".mjs", ".cjs", ".sh", ".py",
+    ] {
+        if base.len() > ext.len()
+            && base[base.len() - ext.len()..].eq_ignore_ascii_case(ext)
+        {
+            return &base[..base.len() - ext.len()];
+        }
+    }
+    base
+}
+
+#[cfg(any(windows, test))]
 fn windows_token_has_binary(tok: &str, name: &str) -> bool {
-    let mut iter = tok.rsplit(['/', '\\']);
-    let base = iter.next().unwrap_or(tok);
-    let base = base
-        .strip_suffix(".exe")
-        .or_else(|| base.strip_suffix(".js"))
-        .or_else(|| base.strip_suffix(".sh"))
-        .or_else(|| base.strip_suffix(".py"))
-        .unwrap_or(base);
+    let segments: Vec<&str> = tok
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(&raw_base) = segments.last() else {
+        return false;
+    };
+    let base = strip_windows_ext(raw_base);
     if base.eq_ignore_ascii_case(name) {
         return true;
     }
-    matches!(
-        (iter.next(), iter.next()),
-        (Some(versions), Some(parent))
-            if versions.eq_ignore_ascii_case("versions") && parent.eq_ignore_ascii_case(name)
-    )
+    if name.eq_ignore_ascii_case("grok") && is_grok_platform_binary(base) {
+        return true;
+    }
+    if segments.len() >= 3
+        && segments[segments.len() - 2].eq_ignore_ascii_case("versions")
+        && segments[segments.len() - 3].eq_ignore_ascii_case(name)
+    {
+        return true;
+    }
+    if (base.eq_ignore_ascii_case("node")
+        || base.eq_ignore_ascii_case("index")
+        || base.eq_ignore_ascii_case("cli")
+        || base.eq_ignore_ascii_case("main")
+        || base.eq_ignore_ascii_case("bundle"))
+        && segments[..segments.len() - 1]
+            .iter()
+            .any(|seg| seg.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    false
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn windows_command_tokens(cmd: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -577,19 +647,45 @@ mod tests {
         assert!(!cmd_has_binary("/some/versions/2.1.121", "claude"));
     }
 
-    #[cfg(windows)]
     #[test]
-    fn cmd_has_binary_windows_detects_node_wrapped_codex() {
-        assert!(cmd_has_binary(
+    fn cmd_has_binary_windows_detects_node_wrapped_codex_and_new_agents() {
+        let win_has = |cmd: &str, name: &str| {
+            windows_command_tokens(cmd)
+                .into_iter()
+                .take(2)
+                .any(|tok| windows_token_has_binary(&tok, name))
+        };
+        assert!(win_has(
             r#""C:\Program Files\nodejs\node.exe" C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js -m gpt-5.5"#,
             "codex",
         ));
+        assert!(win_has(
+            r#""C:\Users\GK\AppData\Local\cursor-agent\versions\2026.10\node.exe" --use-system-ca "C:\Users\GK\AppData\Local\cursor-agent\versions\2026.10\index.js""#,
+            "cursor-agent",
+        ));
+        assert!(win_has(
+            r#""C:\Program Files\nodejs\node.exe" "C:\Users\GK\AppData\Roaming\npm\node_modules\cursor-agent\dist\index.js""#,
+            "cursor-agent",
+        ));
+        assert!(win_has(
+            r#"C:\Users\GK\.grok\downloads\grok-1.0.62-windows-x86_64.exe"#,
+            "grok",
+        ));
+        assert!(win_has(
+            r#"C:\Users\GK\AppData\Roaming\npm\agy.cmd --dangerously-skip-permissions"#,
+            "agy",
+        ));
     }
 
-    #[cfg(windows)]
     #[test]
     fn cmd_has_binary_windows_ignores_codex_in_later_args() {
-        assert!(!cmd_has_binary(
+        let win_has = |cmd: &str, name: &str| {
+            windows_command_tokens(cmd)
+                .into_iter()
+                .take(2)
+                .any(|tok| windows_token_has_binary(&tok, name))
+        };
+        assert!(!win_has(
             r#""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile "C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js""#,
             "codex",
         ));

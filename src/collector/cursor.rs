@@ -52,18 +52,16 @@ impl CursorCollector {
         let mut pid_to_chat = map_pid_to_chat_dir(&pids, &self.cursor_home);
         let mut claimed_chats: HashSet<PathBuf> = pid_to_chat.values().cloned().collect();
 
-        // Fallback: match process cwd to meta.json for PIDs without an FD hit.
+        // Fallback: match process cwd to meta.json or project agent-transcripts for PIDs without an FD hit.
         // Claim each chat immediately so two same-cwd PIDs cannot share one dir.
         for &pid in &pids {
             if pid_to_chat.contains_key(&pid) {
                 continue;
             }
-            let Some(cwd) = get_process_cwd(pid) else {
-                continue;
-            };
-            if let Some(chat_dir) =
-                fallback_chat_dir_for_cwd(&self.cursor_home, &cwd, &claimed_chats)
-            {
+            let chat_dir = get_process_cwd(pid)
+                .and_then(|cwd| fallback_chat_dir_for_cwd(&self.cursor_home, &cwd, &claimed_chats))
+                .or_else(|| fallback_newest_chat_dir(&self.cursor_home, &claimed_chats));
+            if let Some(chat_dir) = chat_dir {
                 claimed_chats.insert(chat_dir.clone());
                 pid_to_chat.insert(pid, chat_dir);
             }
@@ -118,10 +116,25 @@ fn is_cursor_agent_command(command: &str) -> bool {
 }
 
 fn find_cursor_agent_pids(process_info: &HashMap<u32, process::ProcInfo>) -> Vec<u32> {
-    let mut pids: Vec<u32> = process_info
+    let candidates: HashSet<u32> = process_info
         .iter()
         .filter(|(_, info)| is_cursor_agent_command(&info.command))
         .map(|(pid, _)| *pid)
+        .collect();
+
+    // Deduplicate parent/child wrapper pairs (e.g. on Windows when `cursor-agent` launcher
+    // spawns `node.exe ...\cursor-agent\versions\...\index.js`). Prefer the leaf process.
+    let mut pids: Vec<u32> = candidates
+        .iter()
+        .copied()
+        .filter(|&pid| {
+            !candidates.iter().any(|&other| {
+                other != pid
+                    && process_info
+                        .get(&other)
+                        .is_some_and(|oinfo| oinfo.ppid == pid)
+            })
+        })
         .collect();
     pids.sort_unstable();
     pids
@@ -224,24 +237,47 @@ fn read_meta(chat_dir: &Path) -> Option<ChatMeta> {
 }
 
 fn encode_project_path(cwd: &str) -> String {
-    let trimmed = cwd.trim();
-    #[cfg(windows)]
-    let trimmed = trimmed.trim_end_matches(['/', '\\']);
-    #[cfg(not(windows))]
-    let trimmed = trimmed.trim_end_matches('/');
-    let without_root = trimmed.trim_start_matches('/');
-    #[cfg(windows)]
-    let without_root = without_root.trim_start_matches('\\');
-    without_root.replace(['/', '\\'], "-")
+    let trimmed = cwd.trim().trim_end_matches(['/', '\\']);
+    let without_root = trimmed.trim_start_matches(['/', '\\']);
+    let mut out = String::with_capacity(without_root.len());
+    let mut prev_dash = false;
+    for ch in without_root.chars() {
+        if matches!(ch, '/' | '\\' | ':' | '_' | '.') {
+            if !prev_dash && !out.is_empty() {
+                out.push('-');
+                prev_dash = true;
+            }
+        } else {
+            out.push(ch);
+            prev_dash = ch == '-';
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 fn transcript_path(cursor_home: &Path, cwd: &str, session_id: &str) -> PathBuf {
-    cursor_home
-        .join("projects")
+    let projects_root = cursor_home.join("projects");
+    let direct = projects_root
         .join(encode_project_path(cwd))
         .join("agent-transcripts")
         .join(session_id)
-        .join(format!("{session_id}.jsonl"))
+        .join(format!("{session_id}.jsonl"));
+    if direct.is_file() {
+        return direct;
+    }
+    if let Ok(entries) = fs::read_dir(&projects_root) {
+        for entry in entries.flatten() {
+            let candidate = entry
+                .path()
+                .join("agent-transcripts")
+                .join(session_id)
+                .join(format!("{session_id}.jsonl"));
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    direct
 }
 
 fn fallback_chat_dir_for_cwd(
@@ -251,6 +287,7 @@ fn fallback_chat_dir_for_cwd(
 ) -> Option<PathBuf> {
     let chats = cursor_home.join("chats");
     let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
+    let mut by_sid: HashMap<String, PathBuf> = HashMap::new();
     let Ok(hash_entries) = fs::read_dir(&chats) else {
         return None;
     };
@@ -266,6 +303,9 @@ fn fallback_chat_dir_for_cwd(
             let chat_dir = sid_entry.path();
             if claimed.contains(&chat_dir) {
                 continue;
+            }
+            if let Some(sid) = chat_dir.file_name().and_then(|n| n.to_str()) {
+                by_sid.insert(sid.to_string(), chat_dir.clone());
             }
             let Some(meta) = read_meta(&chat_dir) else {
                 continue;
@@ -287,10 +327,92 @@ fn fallback_chat_dir_for_cwd(
             break;
         }
     }
+
+    // Newer cursor-agent builds often create `chats/{hash}/{sid}/store.db` without `meta.json`
+    // while writing transcripts to `projects/{encoded-cwd}/agent-transcripts/{sid}/{sid}.jsonl`.
+    if candidates.is_empty() && !cwd.is_empty() {
+        let target_proj = encode_project_path(cwd);
+        let projects_root = cursor_home.join("projects");
+        if let Ok(proj_entries) = fs::read_dir(&projects_root) {
+            for proj_entry in proj_entries.flatten() {
+                let proj_path = proj_entry.path();
+                let Some(proj_name) = proj_path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !proj_name.eq_ignore_ascii_case(&target_proj) {
+                    continue;
+                }
+                let tr_root = proj_path.join("agent-transcripts");
+                let Ok(tr_entries) = fs::read_dir(&tr_root) else {
+                    continue;
+                };
+                for tr_entry in tr_entries.flatten() {
+                    let tr_dir = tr_entry.path();
+                    let Some(sid) = tr_dir.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if let Some(chat_dir) = by_sid.get(sid) {
+                        if !claimed.contains(chat_dir) {
+                            let mtime = file_mtime_ms(&tr_dir.join(format!("{sid}.jsonl")))
+                                .max(chat_dir_mtime_ms(chat_dir));
+                            candidates.push((mtime, chat_dir.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     candidates
         .into_iter()
         .max_by_key(|(updated, _)| *updated)
         .map(|(_, path)| path)
+}
+
+/// Final fallback for an unclaimed live `cursor-agent` process when open-file FDs are
+/// unavailable (Windows) and `meta.json`/transcript cwd matching misses.
+fn fallback_newest_chat_dir(cursor_home: &Path, claimed: &HashSet<PathBuf>) -> Option<PathBuf> {
+    let chats = cursor_home.join("chats");
+    let hash_entries = fs::read_dir(&chats).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for hash_entry in hash_entries.flatten() {
+        let hash_path = hash_entry.path();
+        if !hash_path.is_dir() {
+            continue;
+        }
+        let Ok(sid_entries) = fs::read_dir(&hash_path) else {
+            continue;
+        };
+        for sid_entry in sid_entries.flatten() {
+            let chat_dir = sid_entry.path();
+            if claimed.contains(&chat_dir) {
+                continue;
+            }
+            let mtime = chat_dir_mtime_ms(&chat_dir);
+            if mtime == 0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(best_t, _)| mtime > *best_t) {
+                best = Some((mtime, chat_dir));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn chat_dir_mtime_ms(chat_dir: &Path) -> u64 {
+    file_mtime_ms(&chat_dir.join("store.db-wal"))
+        .max(file_mtime_ms(&chat_dir.join("store.db")))
+        .max(file_mtime_ms(&chat_dir.join("meta.json")))
+}
+
+fn file_mtime_ms(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(target_os = "windows")]
@@ -785,6 +907,10 @@ mod tests {
             "mnt-sk-repos-abtop"
         );
         assert_eq!(encode_project_path("/Users/foo/bar/"), "Users-foo-bar");
+        assert_eq!(
+            encode_project_path(r"C:\Users\foo\my_repo"),
+            "C-Users-foo-my-repo"
+        );
     }
 
     #[test]
@@ -898,5 +1024,25 @@ mod tests {
         );
         let pids = find_cursor_agent_pids(&info);
         assert_eq!(pids, vec![1]);
+    }
+
+    #[test]
+    fn fallback_matches_chat_dir_without_meta_via_project_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".cursor");
+        let sid = "1471148c-b0ff-47b8-b7a9-e3668f612d86";
+        let chat_dir = home.join("chats/71931c983498cfb7d129288aac75537c").join(sid);
+        let tr_dir = home
+            .join("projects/C-Users-u-my-repo/agent-transcripts")
+            .join(sid);
+        fs::create_dir_all(&chat_dir).unwrap();
+        fs::create_dir_all(&tr_dir).unwrap();
+        fs::write(chat_dir.join("store.db"), b"sqlite").unwrap();
+        fs::write(tr_dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+
+        let claimed = HashSet::new();
+        let picked =
+            fallback_chat_dir_for_cwd(&home, r"C:\Users\u\my_repo", &claimed).unwrap();
+        assert_eq!(picked, chat_dir);
     }
 }

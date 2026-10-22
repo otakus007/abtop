@@ -4,7 +4,7 @@ use crate::model::{
     ToolCall,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -33,19 +33,63 @@ impl GrokCollector {
     fn collect_sessions(&self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         let active = read_active_sessions(&self.home.join("active_sessions.json"));
         let version = read_version(&self.home);
+        let candidate_pids: HashSet<u32> = shared
+            .process_info
+            .iter()
+            .filter(|(_, info)| is_grok_command(&info.command))
+            .map(|(pid, _)| *pid)
+            .collect();
+
+        // Deduplicate parent/child wrapper pairs (e.g. on Windows when a `grok.exe` launcher
+        // spawns `grok-<version>-windows-x86_64.exe` and waits). Prefer the leaf grok process.
+        let mut leaf_pids: Vec<u32> = candidate_pids
+            .iter()
+            .copied()
+            .filter(|&pid| {
+                !candidate_pids.iter().any(|&other| {
+                    other != pid
+                        && shared
+                            .process_info
+                            .get(&other)
+                            .is_some_and(|oinfo| oinfo.ppid == pid)
+                })
+            })
+            .collect();
+        leaf_pids.sort_unstable();
+
         let mut sessions = Vec::new();
-        for (pid, info) in &shared.process_info {
-            if !is_grok_command(&info.command) {
-                continue;
-            }
-            let Some(dir) = resolve_session_dir(&self.home, *pid, &open_paths(*pid), &active)
-            else {
+        let mut claimed_dirs: HashSet<PathBuf> = HashSet::new();
+        for pid in leaf_pids {
+            let Some(info) = shared.process_info.get(&pid) else {
                 continue;
             };
+            let mut related_pids = vec![pid];
+            if info.ppid > 0 && candidate_pids.contains(&info.ppid) {
+                related_pids.push(info.ppid);
+            }
+            let mut open = Vec::new();
+            for &rpid in &related_pids {
+                open.extend(open_paths(rpid));
+            }
+            let dir = resolve_session_dir_for_pids(&self.home, &related_pids, &open, &active)
+                .filter(|d| !claimed_dirs.contains(d))
+                .or_else(|| {
+                    related_pids
+                        .iter()
+                        .find_map(|&rpid| get_process_cwd(rpid))
+                        .and_then(|cwd| {
+                            fallback_session_dir_for_cwd(&self.home, &cwd, &claimed_dirs)
+                        })
+                })
+                .or_else(|| fallback_newest_session_dir(&self.home, &claimed_dirs));
+            let Some(dir) = dir else {
+                continue;
+            };
+            claimed_dirs.insert(dir.clone());
             let mem_mb = info.rss_kb / 1024;
-            let children = child_processes(shared, *pid);
+            let children = child_processes(shared, pid);
             if let Some(session) =
-                session_from_dir(&dir, *pid, mem_mb, children, &version, &self.home)
+                session_from_dir(&dir, pid, mem_mb, children, &version, &self.home)
             {
                 sessions.push(session);
             }
@@ -126,9 +170,14 @@ fn parse_active_sessions(text: &str) -> Vec<ActiveRow> {
         .collect()
 }
 
+#[cfg(test)]
 fn latest_row(rows: &[ActiveRow], pid: u32) -> Option<&ActiveRow> {
+    latest_row_for_pids(rows, &[pid])
+}
+
+fn latest_row_for_pids<'a>(rows: &'a [ActiveRow], pids: &[u32]) -> Option<&'a ActiveRow> {
     rows.iter()
-        .filter(|row| row.pid == pid)
+        .filter(|row| pids.contains(&row.pid))
         .max_by(|a, b| a.opened_at.cmp(&b.opened_at))
 }
 
@@ -182,9 +231,9 @@ fn is_trusted_session_dir(dir: &Path, home: &Path) -> bool {
         )
 }
 
-fn resolve_session_dir(
+fn resolve_session_dir_for_pids(
     home: &Path,
-    pid: u32,
+    pids: &[u32],
     open: &[PathBuf],
     active: &[ActiveRow],
 ) -> Option<PathBuf> {
@@ -199,12 +248,163 @@ fn resolve_session_dir(
             }
         }
     }
-    let preferred = latest_row(active, pid);
+    let preferred = latest_row_for_pids(active, pids);
     if let Some(dir) = pick_open_session_dir(&found, preferred.map(|row| row.session_id.as_str())) {
         return Some(dir);
     }
     let row = preferred?;
     session_dir_for_row(home, row)
+}
+
+/// Fallback when FD discovery and `active_sessions.json` miss (e.g. on Windows):
+/// match process `cwd` against `sessions/<encode_cwd_group(cwd)>/*` or `summary.json`
+/// (`info.cwd` / `source_workspace_dir`).
+fn fallback_session_dir_for_cwd(
+    home: &Path,
+    cwd: &str,
+    claimed: &HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let sessions_root = home.join("sessions");
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+
+    // 1. Direct encoded cwd group directory
+    let group = encode_cwd_group(cwd);
+    if group.len() <= MAX_GROUP_NAME {
+        let group_dir = sessions_root.join(&group);
+        if let Ok(entries) = fs::read_dir(&group_dir) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if !claimed.contains(&dir) && is_valid_top_level_session_dir(&dir) {
+                    candidates.push((dir_mtime(&dir), dir));
+                }
+            }
+        }
+    }
+
+    // 2. Scan session groups and match summary.json `info.cwd` or `source_workspace_dir`
+    if candidates.is_empty() {
+        if let Ok(groups) = fs::read_dir(&sessions_root) {
+            for group_entry in groups.flatten() {
+                let group_path = group_entry.path();
+                if !group_path.is_dir() {
+                    continue;
+                }
+                let Ok(sids) = fs::read_dir(&group_path) else {
+                    continue;
+                };
+                for sid_entry in sids.flatten() {
+                    let dir = sid_entry.path();
+                    if claimed.contains(&dir) {
+                        continue;
+                    }
+                    let Some(summary) = read_json(&dir.join("summary.json")) else {
+                        continue;
+                    };
+                    if summary.get("session_kind").and_then(|v| v.as_str()) == Some("subagent") {
+                        continue;
+                    }
+                    let info_cwd = summary
+                        .pointer("/info/cwd")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let src_ws = summary
+                        .get("source_workspace_dir")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if (!info_cwd.is_empty() && paths_equal(info_cwd, cwd))
+                        || (!src_ws.is_empty() && paths_equal(src_ws, cwd))
+                    {
+                        candidates.push((dir_mtime(&dir), dir));
+                    }
+                }
+            }
+        }
+    }
+
+    candidates
+        .into_iter()
+        .max_by_key(|(mtime, _)| *mtime)
+        .map(|(_, dir)| dir)
+}
+
+/// Final fallback for an unclaimed live `grok` process when `active_sessions.json` is empty
+/// and process `cwd` cannot be matched: pick the most recently updated unclaimed session.
+fn fallback_newest_session_dir(home: &Path, claimed: &HashSet<PathBuf>) -> Option<PathBuf> {
+    let sessions_root = home.join("sessions");
+    let groups = fs::read_dir(&sessions_root).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for group_entry in groups.flatten() {
+        let group_path = group_entry.path();
+        if !group_path.is_dir() {
+            continue;
+        }
+        let Ok(sids) = fs::read_dir(&group_path) else {
+            continue;
+        };
+        for sid_entry in sids.flatten() {
+            let dir = sid_entry.path();
+            if claimed.contains(&dir) || !is_valid_top_level_session_dir(&dir) {
+                continue;
+            }
+            let mtime = dir_mtime(&dir);
+            if best.as_ref().is_none_or(|(best_t, _)| mtime > *best_t) {
+                best = Some((mtime, dir));
+            }
+        }
+    }
+    best.map(|(_, dir)| dir)
+}
+
+fn is_valid_top_level_session_dir(dir: &Path) -> bool {
+    let Some(summary) = read_json(&dir.join("summary.json")) else {
+        return false;
+    };
+    summary.get("session_kind").and_then(|v| v.as_str()) != Some("subagent")
+}
+
+#[cfg(target_os = "windows")]
+fn paths_equal(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn paths_equal(a: &str, b: &str) -> bool {
+    a.trim_end_matches(['/', '\\']) == b.trim_end_matches(['/', '\\'])
+}
+
+#[cfg(target_os = "linux")]
+fn get_process_cwd(pid: u32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn get_process_cwd(pid: u32) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    let pid = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
+    );
+    sys.process(pid)
+        .and_then(|p| p.cwd())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+fn get_process_cwd(_pid: u32) -> Option<String> {
+    None
 }
 
 /// When a process still has files open from more than one session, the
@@ -271,11 +471,10 @@ fn session_from_dir(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let project_name = Path::new(&cwd)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+    let project_name = process::last_path_segment(&cwd)
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "grok".to_string());
+        .unwrap_or("grok")
+        .to_string();
     let usage = read_json(&dir.join("usage.json")).unwrap_or(Value::Null);
     let (input, output, cache_read, cache_create, token_history) = token_fields(&usage);
     let signals = read_json(&dir.join("signals.json")).unwrap_or(Value::Null);
@@ -293,6 +492,8 @@ fn session_from_dir(
     let title = summary
         .get("generated_title")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| summary.get("session_summary").and_then(|v| v.as_str()))
         .unwrap_or("")
         .to_string();
     let session_id = summary
@@ -870,5 +1071,29 @@ mod tests {
         assert_eq!(session.subagents.len(), 1);
         assert_eq!(session.subagents[0].name, "explore");
         assert!(session.first_assistant_text.is_empty());
+    }
+
+    #[test]
+    fn fallback_session_dir_matches_worktree_source_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let dir = home
+            .join("sessions")
+            .join("C%3A%5CUsers%5Cu%5C.grok%5Cworktrees%5Crepos-app%5Cfeat")
+            .join("sid-win-1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"session_kind":"worktree","source_workspace_dir":"D:\\repos\\ToolManhwa","info":{"id":"sid-win-1","cwd":"C:\\Users\\u\\.grok\\worktrees\\repos-app\\feat"}}"#,
+        )
+        .unwrap();
+
+        let claimed = HashSet::new();
+        let picked =
+            fallback_session_dir_for_cwd(home, r"D:\repos\ToolManhwa", &claimed).unwrap();
+        assert_eq!(picked, dir);
+
+        let newest = fallback_newest_session_dir(home, &claimed).unwrap();
+        assert_eq!(newest, dir);
     }
 }
