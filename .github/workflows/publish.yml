@@ -8,9 +8,15 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
+      - name: Check CARGO_REGISTRY_TOKEN
+        if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}
+        run: echo "CARGO_REGISTRY_TOKEN not configured; skipping crates.io publish."
       - uses: actions/checkout@v4
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
       - run: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
